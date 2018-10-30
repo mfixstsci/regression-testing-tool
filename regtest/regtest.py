@@ -1,28 +1,44 @@
-#!/usr/bin/env python
+"""Script to perform regression tests.
 
+Usage:
+  regression_test <report> <db_path> <params> [--num_cpu=<n>]
+
+Arguments:
+  <report>      Name of the report.
+  <db_path>     Absolute path to database. 
+  <params>      Parameters to query database on.
+
+Options:
+  -h --help         Show this screen.
+  --version         Show version.
+  --num_cpu=<n>     number of cpus to use [default: 2]
+"""
+
+#!/usr/bin/env python
 from __future__ import print_function
 
 import argparse
-import os
-import multiprocessing as mp
+from astropy.io import fits
+import crds
 import datetime
+from dask import compute, delayed
+from dask.diagnostics import ProgressBar
+from docopt import docopt
+import jwst
+from jwst.pipeline import (Detector1Pipeline, DarkPipeline, 
+                           Image2Pipeline,Spec2Pipeline)
+from jwst.datamodels import RampModel
 import logging
-
-try:
-    from cStringIO import StringIO  # Python 2
-except ImportError:
-    from io import StringIO
-
+import os
 from sqlalchemy import create_engine
 from sqlalchemy.ext.automap import automap_base
 from sqlalchemy.orm import Session
 
-from astropy.io import fits
-import crds
-import jwst
-from jwst.pipeline import Detector1Pipeline, DarkPipeline, Image2Pipeline, \
-    Spec2Pipeline
-from jwst.datamodels import RampModel
+# Get rid of python 2 stuff in the future.
+try:
+    from cStringIO import StringIO  # Python 2
+except ImportError:
+    from io import StringIO
 
 pipelines = {
     'MIR_IMAGE': [Detector1Pipeline, Image2Pipeline],
@@ -40,7 +56,7 @@ pipelines = {
     'NRC_LED': [Detector1Pipeline],
     'NRC_DARK': [DarkPipeline],
     'NRC_CORON': [Detector1Pipeline, Image2Pipeline],
-    'NRS_DARK':[DarkPipeline},
+    'NRS_DARK':[DarkPipeline],
     'NRS_FIXEDSLIT': [Detector1Pipeline, Spec2Pipeline],
     'NRS_AUTOWAVE': [Detector1Pipeline, Spec2Pipeline],
     'NRS_IFU': [Detector1Pipeline, Spec2Pipeline],
@@ -89,19 +105,16 @@ def get_keyword(keyword, header):
         return str(None)
 
 
-def run_pipeline(args):
+def run_pipeline(fname, report):
     # redirect pipeline log from sys.stderr to a string
     log_stream = StringIO()
     stpipe_log = logging.Logger.manager.loggerDict['stpipe']
     stpipe_log.handlers[0].stream = log_stream
 
-    fname, report = args
-
     if fname in skip_list:
         return
 
     base = fname.split('uncal')[0]
-    print("Beginning " + fname)
 
     header = fits.getheader(fname)
     date = get_keyword('DATE-OBS', header)
@@ -144,8 +157,9 @@ def run_pipeline(args):
         for entry in log_stream.getvalue().split(' - '):
             if 'Pipeline.' in entry:
                 last_step = entry.split('Pipeline.')[-1]
+            else:
+                last_step = '?????'
 
-        result = 'FAILURE'
         error = '{} - "{}"'.format(last_step, str(err))
 
         with open(report, 'a') as f:
@@ -157,23 +171,40 @@ def run_pipeline(args):
                  nints, ngroups, '"FAILED"', '"{}"'.format(str(error)), '\n']))
 
     finally:
-
         # write the pipeline log to a file
         with open(os.path.basename(fname).replace('fits', 'log'), 'w') as f:
             f.write(log_stream.getvalue())
 
+def build_dask_delayed_list(function, data, args):
+    """Build list of dask delayed objects for functions with single arguments.
+    May want to expand for more arguments in the future.
+    Parameters
+    ----------
+    function: func
+        Function to multiprocess
+    data: list-like
+        List of data passed to function.
+    
+    Returns
+    -------
+    dask_delayed_list: list
+        List of dask delayed objects to run in parallel.
+    """
+    
+    dask_delayed_list = []
+
+    for item in data:
+        dask_delayed_list.append(delayed(function)(item, args))
+
+    return dask_delayed_list
 
 def main(args):
     import ast
 
     os.environ['PASS_INVALID_VALUES'] = '1'
-    if args.nproc is not None:
-        p = mp.Pool(args.nproc)
-    else:
-        p = mp.Pool(mp.cpu_count())
 
     _, crds_context = crds.heavy_client.get_processing_mode("jwst")
-    with open(args.report, 'a') as f:
+    with open(args['<report>'], 'a') as f:
         f.write("# CRDS_CONTEXT = '{}'\n".format(crds_context))
         f.write("# run date = {}\n".format(datetime.datetime.now().isoformat()))
         f.write("# cal version = {}\n".format(jwst.__version__))
@@ -186,31 +217,27 @@ def main(args):
 
     Base = automap_base()
     # engine, suppose it has two tables 'user' and 'address' set up
-    engine = create_engine("sqlite:///{}".format(args.db))
+    engine = create_engine("sqlite:///{}".format(args['<db_path>']))
 
     # reflect the tables
     Base.prepare(engine, reflect=True)
-    TestData = Base.classes.test_data
+    # TestData = Base.classes.test_data
+    TestData = Base.classes.regression_data 
     session = Session(engine)
 
     params = {}
-    if args.params:
-        params = ast.literal_eval(args.params)
+    if args['<params>']:
+        params = ast.literal_eval(args['<params>'])
     query = session.query(TestData).filter_by(**params)
     print('found {} matching files'.format(query.count()))
-    files = [data.filename for data in query]
-
-    p.map(run_pipeline, zip(files, [args.report] * len(files)))
-
+    
+    files = [os.path.join(data.path,data.filename) for data in query]
+    results = build_dask_delayed_list(run_pipeline, files, args['<report>'])
+    
+    num_cpu = int(args['--num_cpu'])
+    with ProgressBar():
+        compute(results, num_workers=num_cpu)
 
 def regression_test():
-    parser = argparse.ArgumentParser(
-        description="Regression testing for Calibration Pipeline Build 7rc3")
-    parser.add_argument('db', help='database of files to run the pipeline on')
-    parser.add_argument('--params',
-                        help='dictionary of parameters to filter data by')
-    parser.add_argument('report', help='where to save the results')
-    parser.add_argument('--nproc',
-                        help='number of cores default is all of them', type=int)
-    args = parser.parse_args()
+    args = docopt(__doc__, version='0.1')
     main(args)
