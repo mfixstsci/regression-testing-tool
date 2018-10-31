@@ -152,7 +152,7 @@ def run_pipeline(fname, report):
                  nints, ngroups, '"SUCCESS"', '" "', '\n']))
 
     except Exception as err:
-
+        last_step = '?????'
         # find the last pipeline step mentioned in the log
         for entry in log_stream.getvalue().split(' - '):
             if 'Pipeline.' in entry:
@@ -221,6 +221,7 @@ def main(args):
 
     # reflect the tables
     Base.prepare(engine, reflect=True)
+    
     # TestData = Base.classes.test_data
     TestData = Base.classes.regression_data 
     session = Session(engine)
